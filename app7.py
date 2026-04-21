@@ -26,6 +26,23 @@ TARGET_POSTCODE_PREFIXES = {
     "BS1", "BS2", "BS3", "BS8", "BS9", "BS16", "BS34"
 }
 
+TECH_SIC_CODES = {
+    "58210", "58290", "59111", "59113", "59120", "59140", "59133", "59200",
+    "60100", "60200", "61100", "61200", "61300", "61900", "62011", "62012",
+    "62020", "62030", "62090", "63110", "63120", "71121", "71122", "71200",
+    "72110", "72190", "72200", "82290"
+}
+
+PROPERTY_SIC_CODES = {
+    "68100", "68201", "68209", "41100", "41201", "41202", "42110", "43110"
+}
+
+HOLDINGS_SIC_CODES = {
+    "64201", "64202", "64203", "64204", "64205", "64209", "66300"
+}
+
+TARGET_SIC_CODES = TECH_SIC_CODES | PROPERTY_SIC_CODES | HOLDINGS_SIC_CODES
+
 TARGET_COUNTRIES = {
     "united states", "usa", "us",
     "germany", "france", "netherlands", "spain", "finland",
@@ -36,6 +53,14 @@ TARGET_COUNTRIES = {
 SEEN_FILE = "seen_companies.json"
 OFFICER_CACHE_FILE = "officer_appointments_cache.json"
 RESULTS_FILE = "companies_house_results.csv"
+
+SIC_GROUP_MAP = {}
+for code in TECH_SIC_CODES:
+    SIC_GROUP_MAP[code] = "Tech"
+for code in PROPERTY_SIC_CODES:
+    SIC_GROUP_MAP[code] = "Property"
+for code in HOLDINGS_SIC_CODES:
+    SIC_GROUP_MAP[code] = "Holdings"
 
 
 def inject_auto_refresh(seconds: int):
@@ -95,30 +120,41 @@ class RotatingCHClient:
 
     def get(self, path: str, params: Optional[dict] = None) -> dict:
         retries = 0
+        last_status = None
+        last_text = ""
+
         while retries < 5:
             self._rotate_key_if_needed()
             url = f"{BASE_URL}{path}"
-            resp = self.session.get(url, params=params, auth=self._auth(), timeout=30)
-            self.request_count_on_key += 1
 
-            if resp.status_code == 200:
-                return resp.json()
-            if resp.status_code == 404:
-                return {}
-            if resp.status_code == 429:
-                self.key_index = (self.key_index + 1) % len(self.api_keys)
-                self.request_count_on_key = 0
+            try:
+                resp = self.session.get(url, params=params, auth=self._auth(), timeout=30)
+                self.request_count_on_key += 1
+                last_status = resp.status_code
+                last_text = resp.text[:500]
+
+                if resp.status_code == 200:
+                    return resp.json()
+                if resp.status_code == 404:
+                    return {}
+                if resp.status_code == 429:
+                    self.key_index = (self.key_index + 1) % len(self.api_keys)
+                    self.request_count_on_key = 0
+                    retries += 1
+                    time.sleep(2)
+                    continue
+                if 500 <= resp.status_code < 600:
+                    retries += 1
+                    time.sleep(2)
+                    continue
+
+                raise RuntimeError(f"Request failed: {resp.status_code} {resp.text[:500]}")
+            except requests.RequestException as e:
                 retries += 1
+                last_text = str(e)
                 time.sleep(2)
-                continue
-            if 500 <= resp.status_code < 600:
-                retries += 1
-                time.sleep(2)
-                continue
 
-            raise RuntimeError(f"Request failed: {resp.status_code} {resp.text[:500]}")
-
-        raise RuntimeError(f"Failed after retries for path {path}")
+        raise RuntimeError(f"Failed after retries for path {path} (last status: {last_status}, detail: {last_text})")
 
 
 def load_json_file(path: str, default):
@@ -167,9 +203,97 @@ def postcode_prefix_matches(postcode: Optional[str]) -> bool:
     return any(postcode.startswith(prefix) for prefix in TARGET_POSTCODE_PREFIXES)
 
 
+def sic_matches(company_sic_codes: List[str]) -> bool:
+    return any(code in TARGET_SIC_CODES for code in (company_sic_codes or []))
+
+
+def get_sic_group(company_sic_codes: List[str]) -> str:
+    groups = []
+    for code in company_sic_codes or []:
+        group = SIC_GROUP_MAP.get(code)
+        if group and group not in groups:
+            groups.append(group)
+    return ", ".join(groups) if groups else "Other"
+
+
+def format_gbp_amount(value) -> str:
+    try:
+        num = float(value)
+        if num.is_integer():
+            return f"£{int(num):,}"
+        return f"£{num:,.2f}"
+    except Exception:
+        return ""
+
+
+def extract_gbp_from_capital_list(capital_list) -> str:
+    if not isinstance(capital_list, list):
+        return ""
+
+    for capital_item in capital_list:
+        if not isinstance(capital_item, dict):
+            continue
+        currency = str(capital_item.get("currency", "")).upper().strip()
+        figure = capital_item.get("figure")
+        if currency == "GBP" and figure not in (None, ""):
+            return format_gbp_amount(figure)
+
+    return ""
+
+
+def get_incorporation_statement_of_capital_gbp(client: RotatingCHClient, company_number: str) -> str:
+    """
+    Pull GBP capital from filing history, prioritising incorporation filings.
+    Filing history items can expose description_values.capital with figure/currency.
+    """
+    try:
+        data = client.get(
+            f"/company/{company_number}/filing-history",
+            params={"items_per_page": 100}
+        )
+    except RuntimeError:
+        return ""
+
+    items = data.get("items", []) or []
+    if not items:
+        return ""
+
+    incorporation_candidates = []
+    other_capital_candidates = []
+
+    for item in items:
+        category = (item.get("category") or "").lower()
+        description = (item.get("description") or "").lower()
+        description_values = item.get("description_values") or {}
+
+        capital_value = ""
+        if isinstance(description_values, dict):
+            capital_value = extract_gbp_from_capital_list(description_values.get("capital"))
+
+        if not capital_value:
+            continue
+
+        if category == "incorporation" or "incorporation" in description:
+            incorporation_candidates.append(capital_value)
+        elif category == "capital" or "statement-of-capital" in description or "capital" in description:
+            other_capital_candidates.append(capital_value)
+
+    if incorporation_candidates:
+        return incorporation_candidates[0]
+
+    if other_capital_candidates:
+        return other_capital_candidates[0]
+
+    return ""
+
+
 def get_company_officers(client: RotatingCHClient, company_number: str) -> List[dict]:
-    data = client.get(f"/company/{company_number}/officers")
-    return data.get("items", [])
+    try:
+        data = client.get(f"/company/{company_number}/officers")
+        return data.get("items", [])
+    except RuntimeError as e:
+        st.warning(f"Skipping officers for {company_number}: {e}")
+        return []
 
 
 def is_active_director(officer: dict) -> bool:
@@ -194,11 +318,16 @@ def get_officer_id(officer: dict) -> Optional[str]:
 def get_officer_appointments_count(client: RotatingCHClient, officer_id: str, cache: dict) -> int:
     if officer_id in cache:
         return cache[officer_id]
-    data = client.get(f"/officers/{officer_id}/appointments")
-    total_results = data.get("total_results")
-    count = total_results if total_results is not None else len(data.get("items", []))
-    cache[officer_id] = count
-    return count
+
+    try:
+        data = client.get(f"/officers/{officer_id}/appointments")
+        total_results = data.get("total_results")
+        count = total_results if total_results is not None else len(data.get("items", []))
+        cache[officer_id] = count
+        return count
+    except RuntimeError:
+        cache[officer_id] = 0
+        return 0
 
 
 def advanced_search_companies(client: RotatingCHClient, start_date: str, end_date: str) -> List[dict]:
@@ -210,6 +339,7 @@ def advanced_search_companies(client: RotatingCHClient, start_date: str, end_dat
         params = {
             "incorporated_from": start_date,
             "incorporated_to": end_date,
+            "sic_codes": ",".join(sorted(TARGET_SIC_CODES)),
             "size": size,
             "start_index": start_index,
         }
@@ -263,23 +393,24 @@ def collect_companies(
         for company in companies:
             company_number = company.get("company_number")
             company_name = company.get("company_name", "")
+            sic_codes = company.get("sic_codes", []) or []
             ro_address = company.get("registered_office_address", {}) or {}
             ro_postcode = ro_address.get("postal_code") or ro_address.get("postcode") or company.get("postcode")
 
             if not company_number or company_number in seen_companies:
                 continue
+            if not sic_matches(sic_codes):
+                continue
+
+            incorporation_capital_gbp = get_incorporation_statement_of_capital_gbp(client, company_number)
 
             officers = get_company_officers(client, company_number)
             directors = [o for o in officers if is_active_director(o)]
-
-            if len(directors) < 2:
-                continue
 
             director_names = []
             director_postcodes = []
             has_target_country = False
             has_multi_appointment_director = False
-            matching_country_directors = []
 
             for d in directors:
                 director_names.append(d.get("name", ""))
@@ -291,7 +422,6 @@ def collect_companies(
 
                 if nationality in TARGET_COUNTRIES or residence in TARGET_COUNTRIES:
                     has_target_country = True
-                    matching_country_directors.append(d.get("name", ""))
 
                 officer_id = get_officer_id(d)
                 if officer_id:
@@ -299,19 +429,18 @@ def collect_companies(
                     if appt_count > 1:
                         has_multi_appointment_director = True
 
-            if not has_target_country:
-                continue
-
             first_director_name = director_names[0] if director_names else ""
 
             row = {
                 "company_name": company_name,
                 "company_number": company_number,
+                "Incorporation Capital GBP": incorporation_capital_gbp,
+                "SIC Group": get_sic_group(sic_codes),
                 "Directors": len(directors),
+                "sic_codes": "; ".join(sic_codes),
                 "Postcode": trim_postcode_area(ro_postcode),
                 "In Target Postcode": postcode_prefix_matches(ro_postcode),
                 "international?": has_target_country,
-                "Matching Country Directors": "; ".join([x for x in matching_country_directors if x]),
                 "Serial Founder": has_multi_appointment_director,
                 "Assumed Email": make_assumed_email(first_director_name, company_name),
             }
@@ -369,12 +498,14 @@ def prepare_display_df(df: pd.DataFrame) -> pd.DataFrame:
 
     ordered_cols = [
         "company_name",
+        "Incorporation Capital GBP",
         "Assumed Email",
+        "SIC Group",
         "Directors",
+        "sic_codes",
         "Postcode",
         "In Target Postcode",
         "international?",
-        "Matching Country Directors",
         "Serial Founder",
     ]
     dynamic_cols = [c for c in display_df.columns if c not in ordered_cols]
@@ -384,6 +515,7 @@ def prepare_display_df(df: pd.DataFrame) -> pd.DataFrame:
 
     rename_map = {
         "company_name": "Company Name",
+        "sic_codes": "SIC Codes",
     }
     return display_df.rename(columns=rename_map)
 
@@ -402,9 +534,9 @@ def run_pipeline(api_keys: List[str], date_from: str, date_to: str):
     return rows
 
 
-st.set_page_config(page_title="Companies House Director Monitor", layout="wide")
-st.title("Companies House Director Monitor")
-st.caption("Companies with at least 2 directors and at least 1 director in a target country.")
+st.set_page_config(page_title="Companies House Live Monitor", layout="wide")
+st.title("Companies House Live Monitor")
+st.caption("Auto-refreshing dashboard for filtered Companies House results.")
 
 if "last_run_time" not in st.session_state:
     st.session_state.last_run_time = None
@@ -479,7 +611,7 @@ if should_run_pipeline:
         st.error("Please add at least one Companies House API key in Streamlit secrets before running the app.")
     else:
         try:
-            with st.spinner("Checking Companies House for matching companies..."):
+            with st.spinner("Checking Companies House for new matches..."):
                 new_rows = run_pipeline(api_keys, date_from, date_to)
             st.session_state.last_new_rows = new_rows
             st.session_state.last_run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
