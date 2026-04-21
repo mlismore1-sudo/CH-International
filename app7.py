@@ -120,41 +120,30 @@ class RotatingCHClient:
 
     def get(self, path: str, params: Optional[dict] = None) -> dict:
         retries = 0
-        last_status = None
-        last_text = ""
-
         while retries < 5:
             self._rotate_key_if_needed()
             url = f"{BASE_URL}{path}"
+            resp = self.session.get(url, params=params, auth=self._auth(), timeout=30)
+            self.request_count_on_key += 1
 
-            try:
-                resp = self.session.get(url, params=params, auth=self._auth(), timeout=30)
-                self.request_count_on_key += 1
-                last_status = resp.status_code
-                last_text = resp.text[:500]
-
-                if resp.status_code == 200:
-                    return resp.json()
-                if resp.status_code == 404:
-                    return {}
-                if resp.status_code == 429:
-                    self.key_index = (self.key_index + 1) % len(self.api_keys)
-                    self.request_count_on_key = 0
-                    retries += 1
-                    time.sleep(2)
-                    continue
-                if 500 <= resp.status_code < 600:
-                    retries += 1
-                    time.sleep(2)
-                    continue
-
-                raise RuntimeError(f"Request failed: {resp.status_code} {resp.text[:500]}")
-            except requests.RequestException as e:
+            if resp.status_code == 200:
+                return resp.json()
+            if resp.status_code == 404:
+                return {}
+            if resp.status_code == 429:
+                self.key_index = (self.key_index + 1) % len(self.api_keys)
+                self.request_count_on_key = 0
                 retries += 1
-                last_text = str(e)
                 time.sleep(2)
+                continue
+            if 500 <= resp.status_code < 600:
+                retries += 1
+                time.sleep(2)
+                continue
 
-        raise RuntimeError(f"Failed after retries for path {path} (last status: {last_status}, detail: {last_text})")
+            raise RuntimeError(f"Request failed: {resp.status_code} {resp.text[:500]}")
+
+        raise RuntimeError(f"Failed after retries for path {path}")
 
 
 def load_json_file(path: str, default):
@@ -216,84 +205,9 @@ def get_sic_group(company_sic_codes: List[str]) -> str:
     return ", ".join(groups) if groups else "Other"
 
 
-def format_gbp_amount(value) -> str:
-    try:
-        num = float(value)
-        if num.is_integer():
-            return f"£{int(num):,}"
-        return f"£{num:,.2f}"
-    except Exception:
-        return ""
-
-
-def extract_gbp_from_capital_list(capital_list) -> str:
-    if not isinstance(capital_list, list):
-        return ""
-
-    for capital_item in capital_list:
-        if not isinstance(capital_item, dict):
-            continue
-        currency = str(capital_item.get("currency", "")).upper().strip()
-        figure = capital_item.get("figure")
-        if currency == "GBP" and figure not in (None, ""):
-            return format_gbp_amount(figure)
-
-    return ""
-
-
-def get_incorporation_statement_of_capital_gbp(client: RotatingCHClient, company_number: str) -> str:
-    """
-    Pull GBP capital from filing history, prioritising incorporation filings.
-    Filing history items can expose description_values.capital with figure/currency.
-    """
-    try:
-        data = client.get(
-            f"/company/{company_number}/filing-history",
-            params={"items_per_page": 100}
-        )
-    except RuntimeError:
-        return ""
-
-    items = data.get("items", []) or []
-    if not items:
-        return ""
-
-    incorporation_candidates = []
-    other_capital_candidates = []
-
-    for item in items:
-        category = (item.get("category") or "").lower()
-        description = (item.get("description") or "").lower()
-        description_values = item.get("description_values") or {}
-
-        capital_value = ""
-        if isinstance(description_values, dict):
-            capital_value = extract_gbp_from_capital_list(description_values.get("capital"))
-
-        if not capital_value:
-            continue
-
-        if category == "incorporation" or "incorporation" in description:
-            incorporation_candidates.append(capital_value)
-        elif category == "capital" or "statement-of-capital" in description or "capital" in description:
-            other_capital_candidates.append(capital_value)
-
-    if incorporation_candidates:
-        return incorporation_candidates[0]
-
-    if other_capital_candidates:
-        return other_capital_candidates[0]
-
-    return ""
-
-
 def get_company_officers(client: RotatingCHClient, company_number: str) -> List[dict]:
-    try:
-        data = client.get(f"/company/{company_number}/officers")
-        return data.get("items", [])
-    except RuntimeError as e:
-        st.warning(f"Skipping officers for {company_number}: {e}")
-        return []
+    data = client.get(f"/company/{company_number}/officers")
+    return data.get("items", [])
 
 
 def is_active_director(officer: dict) -> bool:
@@ -318,16 +232,53 @@ def get_officer_id(officer: dict) -> Optional[str]:
 def get_officer_appointments_count(client: RotatingCHClient, officer_id: str, cache: dict) -> int:
     if officer_id in cache:
         return cache[officer_id]
+    data = client.get(f"/officers/{officer_id}/appointments")
+    total_results = data.get("total_results")
+    count = total_results if total_results is not None else len(data.get("items", []))
+    cache[officer_id] = count
+    return count
 
+
+def get_incorporation_capital_gbp(client: RotatingCHClient, company_number: str) -> Optional[str]:
+    """Extract GBP share capital value from Incorporation Statement of Capital in filing history."""
     try:
-        data = client.get(f"/officers/{officer_id}/appointments")
-        total_results = data.get("total_results")
-        count = total_results if total_results is not None else len(data.get("items", []))
-        cache[officer_id] = count
-        return count
-    except RuntimeError:
-        cache[officer_id] = 0
-        return 0
+        # Get filing history
+        filings = client.get(f"/company/{company_number}/filing-history")
+        items = filings.get("items", [])
+        
+        # Look for incorporation statement of capital (usually first few filings)
+        for item in items[:10]:  # Check first 10 filings
+            description = (item.get("description") or "").lower()
+            description_values = item.get("description_values", [])
+            
+            # Match incorporation statement of capital
+            if any(keyword in description for keyword in ["statement of capital", "incorporation", "capital"]):
+                # Get the document content
+                links = item.get("links", {})
+                document_url = links.get("document_metadata")
+                if document_url:
+                    # Try to get the statement of capital directly if available
+                    capital_data = client.get(f"/filing-history/{company_number}", params={"category": "incorporation-statement-of-capital"})
+                    capital_items = capital_data.get("items", [])
+                    if capital_items:
+                        for capital_item in capital_items:
+                            statement = capital_item.get("statement_of_capital", {})
+                            if statement:
+                                shares = statement.get("shares", {})
+                                if shares:
+                                    gbp_value = shares.get("currency", "").upper()
+                                    if gbp_value == "GBP":
+                                        amount = shares.get("amount", "")
+                                        return f"£{amount:,}" if amount else None
+                        
+                        # Fallback: try to parse from description values or other fields
+                        for val in description_values:
+                            if isinstance(val, (int, float)) and val > 0:
+                                return f"£{val:,.0f}"
+        
+        return None
+    except Exception:
+        return None
 
 
 def advanced_search_companies(client: RotatingCHClient, start_date: str, end_date: str) -> List[dict]:
@@ -367,7 +318,7 @@ def make_assumed_email(first_director_name: str, company_name: str) -> str:
 
     first_name = first_director_name.strip().split()[0].lower()
     company_clean = company_name.lower()
-    company_clean = re.sub(r"\blimited\b|\bltd\b|\bplc\b|\bllp\b", "", company_clean)
+    company_clean = re.sub(r"\\blimited\\b|\\bltd\\b|\\bplc\\b|\\bllp\\b", "", company_clean)
     company_clean = re.sub(r"[^a-z0-9]", "", company_clean)
 
     if not first_name or not company_clean:
@@ -402,7 +353,8 @@ def collect_companies(
             if not sic_matches(sic_codes):
                 continue
 
-            incorporation_capital_gbp = get_incorporation_statement_of_capital_gbp(client, company_number)
+            # Get incorporation capital GBP value
+            capital_gbp = get_incorporation_capital_gbp(client, company_number)
 
             officers = get_company_officers(client, company_number)
             directors = [o for o in officers if is_active_director(o)]
@@ -434,7 +386,7 @@ def collect_companies(
             row = {
                 "company_name": company_name,
                 "company_number": company_number,
-                "Incorporation Capital GBP": incorporation_capital_gbp,
+                "Incorporation Capital GBP": capital_gbp or "",
                 "SIC Group": get_sic_group(sic_codes),
                 "Directors": len(directors),
                 "sic_codes": "; ".join(sic_codes),
@@ -516,6 +468,7 @@ def prepare_display_df(df: pd.DataFrame) -> pd.DataFrame:
     rename_map = {
         "company_name": "Company Name",
         "sic_codes": "SIC Codes",
+        "Incorporation Capital GBP": "Share Capital GBP",
     }
     return display_df.rename(columns=rename_map)
 
